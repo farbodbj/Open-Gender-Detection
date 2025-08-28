@@ -1,0 +1,7 @@
+transformers
+PIL
+emoji
+rapidfuzz
+nltk
+hazm
+pandas
