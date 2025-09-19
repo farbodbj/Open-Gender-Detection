@@ -1,7 +1,14 @@
 transformers
-PIL
+pillow
 emoji
 rapidfuzz
 nltk
 hazm
 pandas
+fastapi
+uvicorn[standard]
+python-multipart
+scikit-learn==1.6.1
+requests
+torch
+torchvision

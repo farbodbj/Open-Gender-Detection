@@ -3,7 +3,7 @@ import unicodedata
 from typing import List, Tuple, Optional
 import hazm
 import nltk
-from common import Gender
+from .common import Gender
 import pandas as pd
 from emoji import is_emoji
 from rapidfuzz.distance import Levenshtein, JaroWinkler, DamerauLevenshtein

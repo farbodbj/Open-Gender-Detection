@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  gender-detection-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount datasets and model directories
+      - ./datasets:/app/datasets:ro
+      - ./model:/app/model:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface:rw
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+    environment:
+      - HF_HUB_OFFLINE=1 
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - gender-detection-network
+
+networks:
+  gender-detection-network:
+    driver: bridge

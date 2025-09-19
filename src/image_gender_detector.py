@@ -1,5 +1,5 @@
 import pickle
-from common import Gender
+from .common import Gender
 import requests
 from PIL import Image
 import numpy as np

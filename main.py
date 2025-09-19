@@ -1,174 +1,250 @@
-from typing import Optional, Tuple
-import numpy as np
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+import logging
+import io
+from PIL import Image
+import uvicorn
+
+# Import your existing modules
 from src.name_gender_detector import GenderDetector, DataManager, NameMatcher, SurnameChecker
 from src.image_gender_detector import GenderClassifier
-from PIL import Image
 from src.common import Gender
+from src.aggregated_predictor import WeightedGenderPredictor
 
-import logging
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('app.log'),  # Log to file
-        logging.StreamHandler()          # Log to console
+        logging.FileHandler('api.log'),
+        logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
 
-class WeightedGenderPredictor:
-    def __init__(
-        self,
-        svm_model_path: str,
-        name_detector: GenderDetector,
-        image_weight: float = 0.6,
-        name_weight: float = 0.4,
-        image_uncertainty_threshold: float = 0.6,
-        name_prob_threshold: float = 0.5,
-    ):
-        """
-        Initialize the Weighted Gender Predictor.
+# Initialize FastAPI app
+app = FastAPI(
+    title="Gender Detection API",
+    description="API for detecting gender from names, images, or both",
+    version="1.0.0"
+)
 
-        Args:
-            svm_model_path: Path to the saved SVM model pickle file for image classification
-            name_detector: Instance of GenderDetector for name-based classification
-            image_weight: Weight for image classification (default: 0.6)
-            name_weight: Weight for name classification (default: 0.4)
-            image_uncertainty_threshold: Threshold for uncertain image classifications (default: 0.6)
-            name_prob_threshold: Minimum probability threshold for name classification (default: 0.5)
-        """
-        self.image_classifier = GenderClassifier(
-            svm_model_path=svm_model_path,
-            uncertainty_threshold=image_uncertainty_threshold
+# Pydantic models for request/response
+class NameGenderRequest(BaseModel):
+    display_name: str
+
+class ImageUrlRequest(BaseModel):
+    image_url: str
+
+class CombinedRequest(BaseModel):
+    display_name: Optional[str] = None
+    image_url: Optional[str] = None
+
+class GenderResponse(BaseModel):
+    gender: str
+    confidence: Optional[float]
+    method: str
+
+class ErrorResponse(BaseModel):
+    error: str
+    detail: str
+
+# Global variables for models (initialized on startup)
+name_detector = None
+image_classifier = None
+weighted_predictor = None
+
+def initialize():
+    """Initialize models on server startup"""
+    global name_detector, image_classifier, weighted_predictor
+    
+    try:
+        logger.info("Initializing gender detection models...")
+        import os
+        print(os.listdir('.'))
+        # Initialize name detector
+        data_manager = DataManager(
+            names_file='./datasets/persian-gender-by-name.csv',
+            surnames_file='./datasets/surnames.csv'
         )
-        self.name_detector = name_detector
-        self.image_weight = image_weight
-        self.name_weight = name_weight
-        self.name_prob_threshold = name_prob_threshold
-
-        # Validate weights
-        if not np.isclose(image_weight + name_weight, 1.0):
-            raise ValueError("Weights must sum to 1.0")
-
-    def _normalize_gender_to_score(self, gender: Gender) -> Tuple[float, float]:
-        """
-        Convert gender enum to numerical scores for male and female.
+        matcher = NameMatcher(data_manager)
+        surname_checker = SurnameChecker(data_manager)
         
-        Returns:
-            Tuple of (male_score, female_score)
-        """
-        if gender == Gender.MALE:
-            return (1.0, 0.0)
-        elif gender == Gender.FEMALE:
-            return (0.0, 1.0)
-        else:
-            return (0.0, 0.0)
+        name_detector = GenderDetector(
+            data_manager=data_manager,
+            matcher=matcher,
+            surname_checker=surname_checker
+        )
+        
+        # Initialize image classifier
+        image_classifier = GenderClassifier(
+            svm_model_path="./model/sgd_classifier.pkl",
+            uncertainty_threshold=0.6
+        )
+        
+        # Initialize weighted predictor
+        weighted_predictor = WeightedGenderPredictor(
+            svm_model_path="./model/sgd_classifier.pkl",
+            name_detector=name_detector,
+            image_weight=0.6,
+            name_weight=0.4
+        )
+        
+        logger.info("All models initialized successfully!")
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize models: {str(e)}")
+        raise e
 
-    def predict_from_combined(
-        self,
-        image: Optional[Image.Image] = None,
-        image_url: Optional[str] = None,
-        display_name: Optional[str] = None
-    ) -> Tuple[Gender, Optional[float]]:
-        """
-        Predict gender using weighted voting from both image and name classifiers.
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Gender Detection API",
+        "version": "1.0.0",
+        "endpoints": {
+            "name_detection": "/predict/name",
+            "image_detection": "/predict/image",
+            "image_url_detection": "/predict/image-url",
+            "combined_detection": "/predict/combined",
+            "health": "/health"
+        }
+    }
 
-        Args:
-            image: PIL Image object (optional)
-            image_url: URL of the image to classify (optional)
-            display_name: Display name for name-based classification (optional)
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "models_loaded": {
+            "name_detector": name_detector is not None,
+            "image_classifier": image_classifier is not None,
+            "weighted_predictor": weighted_predictor is not None
+        }
+    }
 
-        Returns:
-            Tuple of predicted Gender enum and combined confidence score (None if unknown)
-        """
-        image_pred = None
-        name_pred = None
-        image_score = 0.0
-        name_score = 0.0
+@app.post("/predict/name", response_model=GenderResponse)
+async def predict_gender_from_name(request: NameGenderRequest):
+    """Predict gender from display name"""
+    try:
+        if not name_detector:
+            raise HTTPException(status_code=500, detail="Name detector not initialized")
+        
+        logger.info(f"Predicting gender for name: {request.display_name}")
+        
+        gender_str, probability = name_detector.guess_gender(request.display_name)
+        
+        return GenderResponse(
+            gender=gender_str,
+            confidence=probability,
+            method="name_based"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in name prediction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-        # Get image prediction if image is provided
-        if image is not None or image_url is not None:
-            if image is not None:
-                image_pred = self.image_classifier.predict_gender(image)
-            else:
-                image_pred = self.image_classifier.predict_from_url(image_url)
+@app.post("/predict/image", response_model=GenderResponse)
+async def predict_gender_from_image(file: UploadFile = File(...)):
+    """Predict gender from uploaded image file"""
+    try:
+        if not image_classifier:
+            raise HTTPException(status_code=500, detail="Image classifier not initialized")
+        
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Read and process image
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
+        
+        logger.info(f"Predicting gender for uploaded image: {file.filename}")
+        
+        gender = image_classifier.predict_gender(image)
+        
+        return GenderResponse(
+            gender=gender.value,
+            confidence=0.6 if gender != Gender.UNKNOWN else None,  # Default confidence
+            method="image_based"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in image prediction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+@app.post("/predict/image-url", response_model=GenderResponse)
+async def predict_gender_from_image_url(request: ImageUrlRequest):
+    """Predict gender from image URL"""
+    try:
+        if not image_classifier:
+            raise HTTPException(status_code=500, detail="Image classifier not initialized")
+        
+        logger.info(f"Predicting gender for image URL: {request.image_url}")
+        
+        gender = image_classifier.predict_from_url(request.image_url)
+        
+        return GenderResponse(
+            gender=gender.value,
+            confidence=0.6 if gender != Gender.UNKNOWN else None,  # Default confidence
+            method="image_based"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in image URL prediction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+@app.post("/predict/combined", response_model=GenderResponse)
+async def predict_gender_combined(
+    request: CombinedRequest,
+    file: Optional[UploadFile] = File(None)
+):
+    """Predict gender using both name and image (weighted combination)"""
+    try:
+        if not weighted_predictor:
+            raise HTTPException(status_code=500, detail="Weighted predictor not initialized")
+        
+        if not request.display_name and not request.image_url and not file:
+            raise HTTPException(
+                status_code=400, 
+                detail="At least one of display_name, image_url, or image file must be provided"
+            )
+        
+        image = None
+        if file:
+            # Validate file type
+            if not file.content_type or not file.content_type.startswith('image/'):
+                raise HTTPException(status_code=400, detail="File must be an image")
             
-            # Convert prediction to scores
-            image_male, image_female = self._normalize_gender_to_score(image_pred)
-            image_score = (image_male - image_female) * self.image_weight
-
-        # Get name prediction if name is provided
-        if display_name is not None:
-            name_gender_str, name_prob = self.name_detector.guess_gender(display_name)
-            
-            # Convert name detector output to our Gender enum
-            if name_gender_str == Gender.MALE.value and name_prob >= self.name_prob_threshold:
-                name_pred = Gender.MALE
-                name_score = name_prob * self.name_weight
-            elif name_gender_str == Gender.FEMALE.value and name_prob >= self.name_prob_threshold:
-                name_pred = Gender.FEMALE
-                name_score = -name_prob * self.name_weight
-            else:
-                name_pred = Gender.UNKNOWN
-
-        # Combine results
-        if image_pred is not None and name_pred is not None:
-            # Weighted voting
-            combined_score = image_score + name_score
-            confidence = abs(combined_score)
-            
-            if combined_score > 0:
-                return Gender.MALE, confidence
-            elif combined_score < 0:
-                return Gender.FEMALE, confidence
-            else:
-                return Gender.UNKNOWN, None
+            # Read and process image
+            contents = await file.read()
+            image = Image.open(io.BytesIO(contents))
         
-        # If only image prediction is available
-        elif image_pred is not None:
-            if image_pred != Gender.UNKNOWN:
-                return image_pred, self.image_weight
-            return Gender.UNKNOWN, None
+        logger.info(f"Combined prediction - Name: {request.display_name}, Image URL: {request.image_url}, File: {file.filename if file else None}")
         
-        # If only name prediction is available
-        elif name_pred is not None:
-            if name_pred != Gender.UNKNOWN and name_prob >= self.name_prob_threshold:
-                return name_pred, name_prob
-            return Gender.UNKNOWN, None
+        gender, confidence = weighted_predictor.predict_from_combined(
+            image=image,
+            image_url=request.image_url,
+            display_name=request.display_name
+        )
         
-        # If no predictions available
-        else:
-            return Gender.UNKNOWN, None
+        return GenderResponse(
+            gender=gender.value,
+            confidence=confidence,
+            method="combined"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in combined prediction: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
-
-# Example usage
 if __name__ == "__main__":
-    # Initialize dependencies
-    data_manager = DataManager(names_file='datasets/persian-gender-by-name.csv', surnames_file='datasets/surnames.csv')
-    matcher = NameMatcher(data_manager)
-    surname_checker = SurnameChecker(data_manager)
-    
-    # Create name detector
-    name_detector = GenderDetector(
-        data_manager=data_manager,
-        matcher=matcher,
-        surname_checker=surname_checker
+    initialize()
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
     )
-    
-    # Create weighted predictor
-    predictor = WeightedGenderPredictor(
-        svm_model_path="model/sgd_classifier.pkl",
-        name_detector=name_detector,
-        image_weight=0.6,
-        name_weight=0.4
-    )
-    
-    # Example prediction
-    url = "https://thispersondoesnotexist.com/"
-    display_name = "John Smith"
-
-    gender, confidence = predictor.predict_from_combined(
-        image = Image.open('male.png'),
-        display_name=display_name
-    )
-    
-    print(f"Predicted gender: {gender.name}, Confidence: {confidence}")
